@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Pomodoro Timer</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body{
+      margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, "Noto Sans JP", sans-serif;
+      display:flex; min-height:100vh; align-items:center; justify-content:center;
+      padding:16px;
+    }
+    .card{
+      width:min(520px, 100%);
+      border:1px solid rgba(127,127,127,.35);
+      border-radius:18px;
+      padding:18px;
+      box-shadow: 0 6px 20px rgba(0,0,0,.08);
+    }
+    h1{ font-size:18px; margin:0 0 12px; opacity:.9; }
+    .row{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    label{ font-size:12px; opacity:.8; display:block; margin-bottom:6px; }
+    input[type="number"]{
+      width:120px; font-size:18px; padding:10px 12px; border-radius:12px;
+      border:1px solid rgba(127,127,127,.35); background:transparent;
+    }
+    button{
+      font-size:16px; padding:12px 14px; border-radius:12px;
+      border:1px solid rgba(127,127,127,.35); background:transparent;
+      cursor:pointer;
+    }
+    button:active{ transform: translateY(1px); }
+    .timer{
+      margin:18px 0 12px;
+      font-variant-numeric: tabular-nums;
+      font-size:64px;
+      text-align:center;
+      letter-spacing: 1px;
+      padding:14px 10px;
+      border-radius:16px;
+      border:1px solid rgba(127,127,127,.35);
+      user-select:none;
+    }
+    .hint{ font-size:12px; opacity:.75; line-height:1.5; }
+    .status{ font-size:13px; margin-top:10px; opacity:.85; }
+    .spacer{ flex:1; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>ポモドーロタイマー</h1>
+
+    <div class="row">
+      <div>
+        <label for="min">分</label>
+        <input id="min" type="number" min="0" max="999" step="1" value="25" inputmode="numeric" />
+      </div>
+      <div>
+        <label for="sec">秒</label>
+        <input id="sec" type="number" min="0" max="59" step="1" value="0" inputmode="numeric" />
+      </div>
+      <div class="spacer"></div>
+    </div>
+
+    <div class="timer" id="display">25:00</div>
+
+    <div class="row">
+      <button id="start">開始</button>
+      <button id="pause" disabled>一時停止</button>
+      <button id="reset" disabled>リセット</button>
+    </div>
+
+    <div class="status" id="status">待機中</div>
+  </div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+
+  const minEl = $("min");
+  const secEl = $("sec");
+  const displayEl = $("display");
+  const statusEl = $("status");
+
+  const startBtn = $("start");
+  const pauseBtn = $("pause");
+  const resetBtn = $("reset");
+
+  let totalMs = 0;
+  let remainingMs = 0;
+
+  let rafId = null;
+  let running = false;
+  let paused = false;
+  let lastTick = 0;
+
+  // Web Audio
+  let audioCtx = null;
+
+  // ✅ 鳴り続けるアラーム制御
+  let alarmOn = false;
+  let alarmTimerId = null;
+  let alarmBar = 0;
+
+  function clampInt(v, min, max) {
+    const n = Number.parseInt(v, 10);
+    if (Number.isNaN(n)) return min;
+    return Math.min(max, Math.max(min, n));
+  }
+
+  function formatMs(ms) {
+    ms = Math.max(0, ms);
+    const totalSec = Math.ceil(ms / 1000);
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    return `${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+  }
+
+  function syncFromInputs() {
+    const m = clampInt(minEl.value, 0, 999);
+    const s = clampInt(secEl.value, 0, 59);
+    minEl.value = m;
+    secEl.value = s;
+    totalMs = (m * 60 + s) * 1000;
+    remainingMs = totalMs;
+    displayEl.textContent = formatMs(remainingMs);
+  }
+
+  function setStatus(text) {
+    statusEl.textContent = text;
+  }
+
+  function setUiState() {
+    if (alarmOn) {
+      startBtn.textContent = "停止";
+      pauseBtn.disabled = true;
+      resetBtn.disabled = false;
+      minEl.disabled = true;
+      secEl.disabled = true;
+      return;
+    }
+
+    startBtn.textContent = running && paused ? "再開" : "開始";
+    pauseBtn.disabled = !running || paused;
+    resetBtn.disabled = !running && remainingMs === totalMs;
+    minEl.disabled = running && !paused;
+    secEl.disabled = running && !paused;
+  }
+
+  function ensureAudioContext() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
+  }
+
+  // ----------------------------
+  // ✅ もっと面白い音楽：8bit + ドラム + たまにフィル + ランダム変化
+  // ----------------------------
+
+  function midiToFreq(midi) {
+    return 440 * Math.pow(2, (midi - 69) / 12);
+  }
+
+  function makeNoiseBuffer(durationSec = 0.2) {
+    const sr = audioCtx.sampleRate;
+    const len = Math.floor(sr * durationSec);
+    const buffer = audioCtx.createBuffer(1, len, sr);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+    return buffer;
+  }
+
+  // キック
+  function kick(t, vel = 1.0) {
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(160, t);
+    osc.frequency.exponentialRampToValueAtTime(55, t + 0.12);
+
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(0.65 * vel, t + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start(t);
+    osc.stop(t + 0.2);
+  }
+
+  // スネア（ノイズ）
+  function snare(t, vel = 1.0) {
+    const noise = audioCtx.createBufferSource();
+    noise.buffer = makeNoiseBuffer(0.16);
+
+    const band = audioCtx.createBiquadFilter();
+    band.type = "bandpass";
+    band.frequency.setValueAtTime(2000, t);
+    band.Q.setValueAtTime(0.9, t);
+
+    const gain = audioCtx.createGain();
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(0.35 * vel, t + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
+
+    noise.connect(band);
+    band.connect(gain);
+    gain.connect(audioCtx.destination);
+
+    noise.start(t);
+    noise.stop(t + 0.18);
+  }
+
+  // ハイハット（ノイズ高域）
+  function hat(t, open = false) {
+    const noise = audioCtx.createBufferSource();
+    noise.buffer = makeNoiseBuffer(open ? 0.14 : 0.05);
+
+    const hp = audioCtx.createBiquadFilter();
+    hp.type = "highpass";
+    hp.frequency.setValueAtTime(6500, t);
+
+    const gain = audioCtx.createGain();
+    const peak = open ? 0.10 : 0.07;
+    const tail = open ? 0.12 : 0.05;
+
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(peak, t + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + tail);
+
+    noise.connect(hp);
+    hp.connect(gain);
+    gain.connect(audioCtx.destination);
+
+    noise.start(t);
+    noise.stop(t + (open ? 0.16 : 0.08));
+  }
+
+  // 8bitっぽいリード（square）
+  function blip(t, freq, dur, vel = 1.0) {
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+
+    osc.type = "square";
+    osc.frequency.setValueAtTime(freq, t);
+
+    // ちょいビブラート（コミカル感）
+    const lfo = audioCtx.createOscillator();
+    const lfoGain = audioCtx.createGain();
+    lfo.type = "sine";
+    lfo.frequency.setValueAtTime(10, t);
+    lfoGain.gain.setValueAtTime(8, t); // 周波数揺れ幅
+    lfo.connect(lfoGain);
+    lfoGain.connect(osc.frequency);
+
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(0.16 * vel, t + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+
+    lfo.start(t);
+    osc.start(t);
+    osc.stop(t + dur);
+    lfo.stop(t + dur);
+  }
+
+  // アルペジオ（和音を分解してピコピコ）
+  function arpBar(startT, bpm, barIndex) {
+    const beat = 60 / bpm;
+    const step = beat / 4; // 16分音符
+    const barSteps = 16;   // 4/4で16分×16 = 1小節
+
+    // コード進行：C → Am → F → G（それっぽい勝利感）
+    const chords = [
+      [72, 76, 79], // C5 E5 G5
+      [69, 72, 76], // A4 C5 E5
+      [65, 69, 72], // F4 A4 C5
+      [67, 71, 74], // G4 B4 D5
+    ];
+    const chord = chords[barIndex % chords.length];
+
+    // たまに転調っぽくズラして面白く（ランダム）
+    const wobble = (Math.random() < 0.25) ? (Math.random() < 0.5 ? 1 : -1) : 0;
+
+    for (let i = 0; i < barSteps; i++) {
+      const t = startT + i * step;
+
+      // ピコピコのパターン（上→中→上→下... みたいに動く）
+      const pick = (i % 4 === 0) ? chord[2]
+                 : (i % 4 === 1) ? chord[1]
+                 : (i % 4 === 2) ? chord[2]
+                 : chord[0];
+
+      // 終盤に“締め”の上昇（ちょいコミカル）
+      const endBoost = (i >= 12) ? (i - 11) : 0;
+
+      // 音程
+      const midi = pick + wobble + endBoost;
+      const freq = midiToFreq(midi);
+
+      // 強弱
+      const vel = (i % 4 === 0) ? 1.2 : 0.9;
+
+      // 長さ（少し短めでピコピコ感）
+      blip(t, freq, step * 0.9, vel);
+    }
+  }
+
+  // ドラム（1小節）
+  function drumBar(startT, bpm, barIndex) {
+    const beat = 60 / bpm;
+    const step = beat / 2; // 8分
+    const sixteen = beat / 4;
+
+    // ハイハットは16分で刻む（時々オープン）
+    for (let i = 0; i < 16; i++) {
+      const t = startT + i * sixteen;
+      const open = (i === 15) && (barIndex % 2 === 1); // 2小節に1回、最後オープン
+      hat(t, open);
+    }
+
+    // キック：1拍目と3拍目、+たまにオマケ
+    kick(startT + 0 * beat, 1.0);
+    kick(startT + 2 * beat, 1.0);
+    if (Math.random() < 0.35) kick(startT + 1.5 * beat, 0.7);
+
+    // スネア：2拍目と4拍目
+    snare(startT + 1 * beat, 1.0);
+    snare(startT + 3 * beat, 1.0);
+
+    // 4小節ごとにフィル（ドドドン）
+    if ((barIndex + 1) % 4 === 0) {
+      for (let i = 0; i < 4; i++) {
+        snare(startT + 3 * beat + i * (sixteen), 0.9);
+      }
+      kick(startT + 3.75 * beat, 1.2);
+    }
+
+    // コミカルな「チッ」アクセント
+    if (Math.random() < 0.25) {
+      hat(startT + 0.75 * beat, false);
+      hat(startT + 2.75 * beat, false);
+    }
+
+    // たまに「レトロ爆発」っぽいノイズ（おまけ）
+    if (Math.random() < 0.12) {
+      const noise = audioCtx.createBufferSource();
+      noise.buffer = makeNoiseBuffer(0.25);
+      const lp = audioCtx.createBiquadFilter();
+      lp.type = "lowpass";
+      lp.frequency.setValueAtTime(1200, startT);
+      lp.frequency.exponentialRampToValueAtTime(200, startT + 0.25);
+      const g = audioCtx.createGain();
+      g.gain.setValueAtTime(0.0001, startT);
+      g.gain.exponentialRampToValueAtTime(0.10, startT + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, startT + 0.24);
+      noise.connect(lp); lp.connect(g); g.connect(audioCtx.destination);
+      noise.start(startT + 3.5 * beat);
+      noise.stop(startT + 3.8 * beat);
+    }
+  }
+
+  // ✅ 1小節ぶんの「面白い音楽」を鳴らす（スケジューリング）
+  function playFunnyBar(barIndex) {
+    ensureAudioContext();
+    const bpm = 156; // ちょい速めでゲームっぽく
+    const beat = 60 / bpm;
+    const barLen = 4 * beat;
+
+    // 少し先の未来に予約（ズレにくい）
+    const startT = audioCtx.currentTime + 0.02;
+
+    drumBar(startT, bpm, barIndex);
+    arpBar(startT, bpm, barIndex);
+
+    return barLen; // 小節長（秒）
+  }
+
+  // ✅ アラーム開始（ボタン押すまで鳴り続ける）
+  function startAlarm() {
+    if (alarmOn) return;
+    alarmOn = true;
+    alarmBar = 0;
+
+    setStatus("⏰ ピコピコ鳴り続けます（停止/リセットで止まります）");
+    setUiState();
+
+    // 最初のバイブ
+    if (navigator.vibrate) navigator.vibrate([120, 60, 120, 60, 220]);
+
+    // まず1小節
+    const firstLen = playFunnyBar(alarmBar++);
+    // 小節ごとに繰り返す（ランダム変化があるので飽きにくい）
+    alarmTimerId = setInterval(() => {
+      if (!alarmOn) return;
+      playFunnyBar(alarmBar++);
+      if (navigator.vibrate) navigator.vibrate([60, 40, 60]); // 軽め
+    }, Math.max(200, Math.floor(firstLen * 1000)));
+  }
+
+  // ✅ アラーム停止
+  function stopAlarm() {
+    if (!alarmOn) return;
+    alarmOn = false;
+    if (alarmTimerId) clearInterval(alarmTimerId);
+    alarmTimerId = null;
+
+    setStatus("待機中");
+    setUiState();
+  }
+
+  function stopLoop() {
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+    running = false;
+    paused = false;
+    lastTick = 0;
+  }
+
+  function finish() {
+    remainingMs = 0;
+    displayEl.textContent = "00:00";
+    stopLoop();
+    setUiState();
+    startAlarm();
+  }
+
+  function loop(ts) {
+    if (!running || paused) return;
+    if (!lastTick) lastTick = ts;
+    const delta = ts - lastTick;
+    lastTick = ts;
+
+    remainingMs -= delta;
+
+    if (remainingMs <= 0) {
+      finish();
+      return;
+    }
+
+    displayEl.textContent = formatMs(remainingMs);
+    rafId = requestAnimationFrame(loop);
+  }
+
+  function startOrResumeOrStopAlarm() {
+    ensureAudioContext();
+
+    // アラーム中なら停止
+    if (alarmOn) {
+      stopAlarm();
+      syncFromInputs();
+      setStatus("待機中");
+      setUiState();
+      return;
+    }
+
+    if (!running) {
+      syncFromInputs();
+      if (totalMs <= 0) {
+        setStatus("時間を設定してください（0秒は不可）");
+        return;
+      }
+      running = true;
+      paused = false;
+      lastTick = 0;
+      setStatus("カウントダウン中");
+      setUiState();
+      rafId = requestAnimationFrame(loop);
+      return;
+    }
+
+    if (paused) {
+      paused = false;
+      lastTick = 0;
+      setStatus("カウントダウン中（再開）");
+      setUiState();
+      rafId = requestAnimationFrame(loop);
+    }
+  }
+
+  function pause() {
+    if (alarmOn) return;
+    if (!running || paused) return;
+    paused = true;
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+    setStatus("一時停止中");
+    setUiState();
+  }
+
+  function reset() {
+    if (alarmOn) stopAlarm();
+    stopLoop();
+    syncFromInputs();
+    setStatus("待機中");
+    setUiState();
+  }
+
+  function onInputChanged() {
+    if (alarmOn) return;
+    if (running && !paused) return;
+    syncFromInputs();
+    setUiState();
+    setStatus("待機中");
+  }
+
+  startBtn.addEventListener("click", startOrResumeOrStopAlarm);
+  pauseBtn.addEventListener("click", pause);
+  resetBtn.addEventListener("click", reset);
+
+  minEl.addEventListener("change", onInputChanged);
+  secEl.addEventListener("change", onInputChanged);
+  minEl.addEventListener("input", onInputChanged);
+  secEl.addEventListener("input", onInputChanged);
+
+  // 初期化
+  syncFromInputs();
+  setUiState();
+})();
+</script>
+</body>
+</html>
